@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-. .env
+THIS_SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+
+. "$THIS_SCRIPT_DIR/.env"
 . "$CLASH_BASE_DIR/scripts/cmd/clashctl.sh" 2>/dev/null
-. scripts/preflight.sh
+. "$THIS_SCRIPT_DIR/scripts/preflight.sh"
 
 pgrep -f "$BIN_KERNEL" -u 0 >/dev/null && ! _is_root && _error_quit "请先关闭 Tun 模式"
 clashoff 2>/dev/null

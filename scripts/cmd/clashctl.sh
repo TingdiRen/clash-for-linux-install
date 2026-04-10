@@ -659,6 +659,323 @@ _logging_sub() {
 _sub_log() {
     tail <"${CLASH_PROFILES_LOG}" "$@"
 }
+_urlencode() {
+    local raw="$1"
+    local out=""
+    local i ch hex
+    LC_ALL=C
+    for ((i = 0; i < ${#raw}; i++)); do
+        ch="${raw:i:1}"
+        case "$ch" in
+        [a-zA-Z0-9.~_-])
+            out+="$ch"
+            ;;
+        *)
+            printf -v hex '%%%02X' "'$ch"
+            out+="$hex"
+            ;;
+        esac
+    done
+    echo "$out"
+}
+_json_escape() {
+    local raw="$1"
+    local out=""
+    local i ch
+    LC_ALL=C
+    for ((i = 0; i < ${#raw}; i++)); do
+        ch="${raw:i:1}"
+        case "$ch" in
+        '"')
+            out+='\"'
+            ;;
+        '\\')
+            out+='\\'
+            ;;
+        $'\b')
+            out+='\b'
+            ;;
+        $'\f')
+            out+='\f'
+            ;;
+        $'\n')
+            out+='\n'
+            ;;
+        $'\r')
+            out+='\r'
+            ;;
+        $'\t')
+            out+='\t'
+            ;;
+        *)
+            out+="$ch"
+            ;;
+        esac
+    done
+    echo "$out"
+}
+_node_profile_path() {
+    local profile_arg="$1"
+    local profile_path
+
+    if [ -z "$profile_arg" ]; then
+        [ -s "$CLASH_CONFIG_RUNTIME" ] && profile_path="$CLASH_CONFIG_RUNTIME"
+        if [ -z "$profile_path" ] || [ "$profile_path" = "null" ]; then
+            local use_id
+            use_id=$("$BIN_YQ" '.use // 1' "$CLASH_PROFILES_META")
+            profile_path=$("$BIN_YQ" -r ".profiles[] | select((.id|tostring) == \"${use_id}\") | .path" "$CLASH_PROFILES_META" 2>/dev/null)
+        fi
+    elif [[ "$profile_arg" =~ ^[0-9]+$ ]]; then
+        profile_path=$("$BIN_YQ" -r ".profiles[] | select((.id|tostring) == \"${profile_arg}\") | .path" "$CLASH_PROFILES_META" 2>/dev/null)
+    else
+        profile_path="$profile_arg"
+    fi
+
+    [ -n "$profile_path" ] && [ "$profile_path" != "null" ] && [ -f "$profile_path" ] || return 1
+    echo "$profile_path"
+}
+_node_api_args() {
+    local ext_addr ext_ip ext_port secret
+    ext_addr=$("$BIN_YQ" '.external-controller // "127.0.0.1:9090"' "$CLASH_CONFIG_RUNTIME")
+    ext_ip=${ext_addr%%:*}
+    ext_port=${ext_addr##*:}
+    case "$ext_ip" in
+    '' | '0.0.0.0' | '*')
+        ext_ip='127.0.0.1'
+        ;;
+    esac
+
+    secret=$(_get_secret)
+    NODE_CTRL_ADDR="http://${ext_ip}:${ext_port}"
+    if [ -n "$secret" ]; then
+        NODE_AUTH_HEADER=("-H" "Authorization: Bearer ${secret}")
+    else
+        NODE_AUTH_HEADER=()
+    fi
+}
+_node_check_api() {
+    _node_api_args
+    curl --silent --noproxy "*" --max-time 2 \
+        "${NODE_AUTH_HEADER[@]}" \
+        "${NODE_CTRL_ADDR}/version" |
+        grep -q '"version"' || {
+        _failcat "无法连接到 Clash API：${NODE_CTRL_ADDR}，请先执行 clashon"
+        return 1
+    }
+}
+_node_list_groups() {
+    local profile_path groups
+    profile_path=$(_node_profile_path "$1") || {
+        _failcat '未找到可用配置，请先 clashsub add 并 clashsub use'
+        return 1
+    }
+    groups=$("$BIN_YQ" -r '."proxy-groups"[] | select(.type == "select") | .name' "$profile_path")
+    [ -n "$groups" ] || {
+        _failcat "当前配置中没有可手动切换的策略组：$profile_path"
+        return 1
+    }
+    printf '%s\n' "$groups" | nl -w1 -s'. '
+}
+_node_resolve_group_name() {
+    local group_selector="$1"
+    local profile_path="$2"
+    [ -n "$group_selector" ] || return 1
+
+    local group_name
+    group_name=$(
+        group="$group_selector" "$BIN_YQ" -r \
+            '."proxy-groups"[] | select(.type == "select" and .name == env(group)) | .name' \
+            "$profile_path"
+    )
+    [ -n "$group_name" ] && {
+        printf '%s\n' "$group_name"
+        return 0
+    }
+
+    if [[ "$group_selector" =~ ^[0-9]+$ ]]; then
+        group_name=$(
+            "$BIN_YQ" -r '."proxy-groups"[] | select(.type == "select") | .name' "$profile_path" |
+                sed -n "${group_selector}p"
+        )
+        [ -n "$group_name" ] && {
+            printf '%s\n' "$group_name"
+            return 0
+        }
+    fi
+    _failcat "未找到策略组：${group_selector}"
+    return 1
+}
+_node_list_nodes() {
+    local group_selector="$1"
+    local profile_arg="$2"
+    [ -z "$group_selector" ] && {
+        _failcat '用法：clashnode nodes <策略组名> [订阅id|配置文件路径]'
+        return 1
+    }
+
+    local profile_path group_name nodes
+    profile_path=$(_node_profile_path "$profile_arg") || {
+        _failcat '未找到可用配置'
+        return 1
+    }
+    group_name=$(_node_resolve_group_name "$group_selector" "$profile_path") || return 1
+    nodes=$(_node_list_raw_nodes "$group_name" "$profile_path")
+    [ -n "$nodes" ] || {
+        _failcat "未找到策略组：${group_name}"
+        return 1
+    }
+    printf '%s\n' "$nodes" | nl -w1 -s'. '
+}
+_node_list_raw_nodes() {
+    local group_name="$1"
+    local profile_path="$2"
+    group="$group_name" "$BIN_YQ" -r '."proxy-groups"[] | select(.name == env(group)) | .proxies[]' "$profile_path"
+}
+_node_resolve_node_name() {
+    local group_name="$1"
+    local node_selector="$2"
+    local profile_path="$3"
+    [ -n "$node_selector" ] || return 1
+
+    local node_name
+    node_name=$(
+        group="$group_name" "$BIN_YQ" -r '."proxy-groups"[] | select(.name == env(group)) | .proxies[]' "$profile_path" |
+            grep -Fx -- "$node_selector"
+    )
+    [ -n "$node_name" ] && {
+        printf '%s\n' "$node_name"
+        return 0
+    }
+
+    if [[ "$node_selector" =~ ^[0-9]+$ ]]; then
+        node_name=$(_node_list_raw_nodes "$group_name" "$profile_path" | sed -n "${node_selector}p")
+        [ -n "$node_name" ] && {
+            printf '%s\n' "$node_name"
+            return 0
+        }
+    fi
+
+    _failcat "未找到节点：${node_selector}"
+    return 1
+}
+_node_current() {
+    local group_selector="$1"
+    [ -z "$group_selector" ] && {
+        _failcat '用法：clashnode current <策略组名>'
+        return 1
+    }
+
+    _node_check_api || return 1
+    local group_name
+    group_name=$(_node_resolve_group_name "$group_selector" "$CLASH_CONFIG_RUNTIME") || return 1
+    local current
+    current=$(
+        curl --silent --noproxy "*" --max-time 3 \
+            "${NODE_AUTH_HEADER[@]}" \
+            "${NODE_CTRL_ADDR}/proxies" |
+            group="$group_name" "$BIN_YQ" -r '.proxies[env(group)].now // ""'
+    )
+    [ -n "$current" ] || {
+        _failcat "未找到策略组：${group_name}"
+        return 1
+    }
+    printf '%s\n' "$current"
+}
+_node_use() {
+    local group_selector="$1"
+    local node_selector="$2"
+    [ -z "$group_selector" ] || [ -z "$node_selector" ] && {
+        _failcat '用法：clashnode use <策略组名> <节点名>'
+        return 1
+    }
+
+    _node_check_api || return 1
+
+    local group_name node_name group_encoded payload res
+    group_name=$(_node_resolve_group_name "$group_selector" "$CLASH_CONFIG_RUNTIME") || return 1
+    node_name=$(_node_resolve_node_name "$group_name" "$node_selector" "$CLASH_CONFIG_RUNTIME") || return 1
+    group_encoded=$(_urlencode "$group_name")
+    payload="{\"name\":\"$(_json_escape "$node_name")\"}"
+    res=$(
+        curl --silent --show-error --noproxy "*" --max-time 5 \
+            -X PUT \
+            "${NODE_CTRL_ADDR}/proxies/${group_encoded}" \
+            -H 'Content-Type: application/json' \
+            "${NODE_AUTH_HEADER[@]}" \
+            --data "$payload"
+    ) || {
+        _failcat "切换失败：无法连接到 Clash API：${NODE_CTRL_ADDR}"
+        return 1
+    }
+
+    grep -q '"error"' <<<"$res" && {
+        _failcat "切换失败：${res}"
+        return 1
+    }
+    _okcat "节点已切换：${group_name} -> ${node_name}"
+}
+function clashnode() {
+    case "$1" in
+    -h | --help | '')
+        cat <<'EOF'
+clashnode - 节点查看与切换
+
+Usage:
+  clashnode groups [订阅id|配置文件路径]
+  clashnode nodes <策略组名> [订阅id|配置文件路径]
+  clashnode current <策略组名>
+  clashnode use <策略组名> <节点名>
+
+Examples:
+  # 查看所有可切换策略组，输出带 1-based 序号
+  clashnode groups
+
+  # 查看指定订阅中的策略组
+  clashnode groups 1
+
+  # 查看第 1 个策略组下的节点，输出带 1-based 序号
+  clashnode nodes 1
+
+  # 查看第 1 个策略组当前选中的节点
+  clashnode current 1
+
+  # 切换到第 1 个策略组下的第 3 个节点
+  clashnode use 1 3
+
+  # 也支持直接传完整名称
+  clashnode nodes "🐟 Others"
+  clashnode use "🐟 Others" "🇸🇬 Large 新加坡01 | 倍率:1.8"
+
+Notes:
+  groups/nodes 默认读取当前运行时配置；传入订阅 id 或配置文件路径时读取指定配置。
+  current/use 通过 Clash external-controller API 查询和切换节点，请先执行 clashon。
+  策略组参数支持完整名称，或 clashnode groups 输出中的 1-based 序号。
+  节点参数支持完整名称，或 clashnode nodes 输出中的 1-based 序号。
+  推荐顺序：先执行 clashnode groups，再执行 clashnode nodes <组序号>，最后执行 clashnode use <组序号> <节点序号>。
+EOF
+        ;;
+    groups | list | ls)
+        shift
+        _node_list_groups "$@"
+        ;;
+    nodes)
+        shift
+        _node_list_nodes "$@"
+        ;;
+    current)
+        shift
+        _node_current "$@"
+        ;;
+    use)
+        shift
+        _node_use "$@"
+        ;;
+    *)
+        _failcat '未知子命令，执行 clashnode -h 查看帮助'
+        return 1
+        ;;
+    esac
+}
 
 function clashctl() {
     case "$1" in
@@ -702,6 +1019,10 @@ function clashctl() {
         shift
         clashsub "$@"
         ;;
+    node)
+        shift
+        clashnode "$@"
+        ;;
     upgrade)
         shift
         clashupgrade "$@"
@@ -726,6 +1047,7 @@ Commands:
   status                内核状态
   ui                    面板地址
   sub                   订阅管理
+  node                  节点查看与切换
   log                   内核日志
   tun                   Tun 模式
   mixin                 Mixin 配置

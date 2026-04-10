@@ -43,6 +43,7 @@ Commands:
     ui                    Web 面板
     secret                Web 密钥
     sub                   订阅管理
+    node                  节点切换
     upgrade               升级内核
     tun                   Tun 模式
     mixin                 Mixin 配置
@@ -145,6 +146,36 @@ Options:
 - 支持添加本地订阅，例如：`file:///root/clashctl/resources/config.yaml`
 - 当订阅链接解析失败或包含特殊字符时，请使用引号包裹以避免被错误解析。
 - 自动更新任务可通过 `crontab -e` 进行修改和管理。
+
+### 命令行切换节点
+
+```bash
+$ clashnode groups
+列出当前运行时配置中的可选策略组，并显示序号
+
+$ clashnode groups 1
+列出订阅 1 中的可选策略组，并显示序号
+
+$ clashnode nodes 1
+列出第 1 个策略组的可选节点，并显示序号
+
+$ clashnode current 1
+查看第 1 个策略组当前节点
+
+$ clashnode use 1 3
+切换成功
+
+$ clashnode use "🐟 Others" "🇸🇬 Large 新加坡01 | 倍率:1.8"
+也支持直接传完整名称
+```
+
+- `clashnode` 可在无法访问 `Web UI` 时，通过命令行查看并切换当前节点。
+- `groups/nodes` 默认读取当前运行时配置；也支持传入订阅 id 或配置文件路径，例如：`clashnode groups 1`。
+- `current/use` 通过内核 external-controller API 工作，请先执行 `clashon`。
+- 策略组参数支持完整名称，或 `clashnode groups` 输出中的 1-based 序号。
+- 节点参数支持完整名称，或 `clashnode nodes` 输出中的 1-based 序号。
+- 推荐顺序：先执行 `clashnode groups`，再执行 `clashnode nodes <组序号>`，最后执行 `clashnode use <组序号> <节点序号>`。
+- 致谢：命令行节点查看与切换能力基于 [PR #531](https://github.com/nelvko/clash-for-linux-install/pull/531) 中 [@Tendourisu](https://github.com/Tendourisu) 的实现思路移植；本次补充了策略组与节点的序号选择和帮助文档，减少带 emoji 名称时的操作成本。
 
 ### `Tun` 模式
 
